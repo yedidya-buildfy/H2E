@@ -3,11 +3,21 @@
 """
 import tkinter as tk
 from tkinter import ttk, messagebox
-import keyboard
 import pyperclip
 import converter
 import translator
 from keyboard_utils import detect_language
+import threading
+import time
+import ctypes
+
+try:
+    from pynput import keyboard
+    from pynput.keyboard import Key, KeyCode
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    PYNPUT_AVAILABLE = False
+    import keyboard as keyboard_lib  # ספריית keyboard המקורית כגיבוי
 
 class KeyboardConverterApp:
     def __init__(self, root):
@@ -17,11 +27,16 @@ class KeyboardConverterApp:
         self.root.resizable(True, True)
         
         # משתני המצב
-        self.hotkey = "alt+q"
-        self.translate_hotkey = "ctrl+w"
+        self.hotkey = "ctrl+q"  # קיצור מקשים להמרה
+        self.translate_hotkey = "ctrl+w"  # קיצור מקשים לתרגום
         self.direction = "auto"
         self.is_listening = False
         self.auto_switch_language = True
+        self.listener = None  # לpynput
+        
+        # בדיקה אם pynput זמין
+        if not PYNPUT_AVAILABLE:
+            messagebox.showwarning("אזהרה", "ספריית pynput לא נמצאה. נא להתקין אותה עם הפקודה: pip install pynput")
         
         # יצירת הממשק
         self.create_gui()
@@ -63,7 +78,7 @@ class KeyboardConverterApp:
         self.toggle_button = ttk.Button(hotkey_inner_frame, text="הפעל האזנה לקיצורי מקשים", command=self.toggle_listener)
         self.toggle_button.grid(row=0, column=3, rowspan=2, padx=5)
         
-        ttk.Label(hotkey_inner_frame, text="דוגמאות: alt+q, ctrl+w, alt+shift+k").grid(row=2, column=0, columnspan=4, pady=5, sticky=tk.W)
+        ttk.Label(hotkey_inner_frame, text="לדוגמה: ctrl+q, ctrl+w").grid(row=2, column=0, columnspan=4, pady=5, sticky=tk.W)
         
         # בחירת כיוון ההמרה
         direction_frame = ttk.LabelFrame(main_frame, text="כיוון המרה")
@@ -188,6 +203,7 @@ class KeyboardConverterApp:
    - הקש על קיצור מקשי התרגום לתרגום הטקסט המסומן
 
 * בלשוניות המתאימות ניתן לבדוק את ההמרה והתרגום לפני השימוש בקיצורי המקשים
+* שים לב: יש להתקין את ספריית pynput: pip install pynput
         """
         
         instruction_label = ttk.Label(main_frame, text=instruction_text, justify=tk.LEFT, wraplength=550)
@@ -204,12 +220,104 @@ class KeyboardConverterApp:
         self.status_var.set(message)
         self.root.update_idletasks()
     
+    def perform_translation(self):
+        """פונקציה לביצוע תרגום"""
+        try:
+            translator.hotkey_translation(
+                self.trans_direction_var.get(),
+                self.update_status
+            )
+        except Exception as e:
+            self.update_status(f"שגיאה בתרגום: {str(e)}")
+    
+    def perform_conversion(self):
+        """פונקציה לביצוע המרה"""
+        try:
+            converter.hotkey_conversion(
+                self.direction, 
+                self.auto_switch_language, 
+                self.update_status
+            )
+        except Exception as e:
+            self.update_status(f"שגיאה בהמרה: {str(e)}")
+    
+    def parse_hotkey(self, hotkey_str):
+        """המרת מחרוזת קיצור מקשים למבנה של pynput"""
+        parts = hotkey_str.lower().split('+')
+        modifiers = []
+        key = None
+        
+        for part in parts[:-1]:  # כל החלקים פרט לאחרון הם מקשי modifier
+            if part == 'ctrl':
+                modifiers.append(Key.ctrl)
+            elif part == 'alt':
+                modifiers.append(Key.alt)
+            elif part == 'shift':
+                modifiers.append(Key.shift)
+            elif part == 'cmd' or part == 'win':
+                modifiers.append(Key.cmd)
+        
+        # החלק האחרון הוא המקש עצמו
+        last_part = parts[-1]
+        if len(last_part) == 1:  # אם זה תו יחיד
+            key = KeyCode.from_char(last_part)
+        elif last_part.startswith('f') and last_part[1:].isdigit():  # מקשי F1-F12
+            f_num = int(last_part[1:])
+            if 1 <= f_num <= 12:
+                key = getattr(Key, f'f{f_num}')
+        else:
+            # מקשים מיוחדים אחרים
+            special_keys = {
+                'space': Key.space,
+                'esc': Key.esc,
+                'tab': Key.tab,
+                'enter': Key.enter,
+                'backspace': Key.backspace
+            }
+            key = special_keys.get(last_part)
+        
+        return (modifiers, key)
+    
+    def on_pynput_press(self, key):
+        """מטפל בלחיצות מקשים כשמשתמשים בpynput"""
+        # בדיקה אם זה המקש של הקונטרול
+        ctrl_pressed = Key.ctrl in self.current_keys
+        
+        # זיהוי מקש Q (לפי הקוד ASCII שלו)
+        if hasattr(key, 'char') and key.char == 'q' and ctrl_pressed:
+            # הפעלת המרה
+            threading.Thread(target=self.perform_conversion).start()
+            return True
+        
+        # זיהוי מקש W (לפי הקוד ASCII שלו)
+        if hasattr(key, 'char') and key.char == 'w' and ctrl_pressed:
+            # הפעלת תרגום
+            threading.Thread(target=self.perform_translation).start()
+            return True
+        
+        # הוספת המקש לרשימת המקשים הלחוצים
+        if key not in self.current_keys:
+            self.current_keys.add(key)
+    
+    def on_pynput_release(self, key):
+        """מטפל בשחרור מקשים כשמשתמשים בpynput"""
+        # הסרת המקש מרשימת המקשים הלחוצים
+        if key in self.current_keys:
+            self.current_keys.remove(key)
+    
     def toggle_listener(self):
         """פונקציה להפעלה/כיבוי של האזנה לקיצורי המקשים"""
         if self.is_listening:
             # כיבוי האזנה
             self.is_listening = False
-            keyboard.unhook_all()
+            
+            if PYNPUT_AVAILABLE and self.listener:
+                self.listener.stop()
+                self.listener = None
+            else:
+                # שימוש בספריית keyboard כגיבוי
+                keyboard_lib.unhook_all()
+            
             self.toggle_button.config(text="הפעל האזנה לקיצורי מקשים")
             self.update_status("האזנה לקיצורי מקשים כבויה")
             self.hotkey_entry.config(state="normal")
@@ -229,38 +337,27 @@ class KeyboardConverterApp:
                 return
             
             try:
-                # בדיקה אם קיצורי המקשים תקינים
-                keyboard.add_hotkey(new_hotkey, lambda: None)
-                keyboard.remove_hotkey(new_hotkey)
-                
-                keyboard.add_hotkey(new_translate_hotkey, lambda: None)
-                keyboard.remove_hotkey(new_translate_hotkey)
-                
                 # שמירת קיצורי המקשים החדשים
                 self.hotkey = new_hotkey
                 self.translate_hotkey = new_translate_hotkey
                 
-                # הפעלת האזנה
+                if PYNPUT_AVAILABLE:
+                    # שימוש בpynput
+                    self.current_keys = set()
+                    
+                    # מתחיל האזנה למקשים
+                    self.listener = keyboard.Listener(
+                        on_press=self.on_pynput_press,
+                        on_release=self.on_pynput_release
+                    )
+                    self.listener.start()
+                else:
+                    # שימוש בספריית keyboard כגיבוי
+                    keyboard_lib.add_hotkey(self.hotkey, self.perform_conversion)
+                    keyboard_lib.add_hotkey(self.translate_hotkey, self.perform_translation)
+                
+                # עדכון המצב
                 self.is_listening = True
-                
-                # הגדרת הפונקציות שיופעלו עם קיצורי המקשים
-                keyboard.add_hotkey(
-                    self.hotkey, 
-                    lambda: converter.hotkey_conversion(
-                        self.direction, 
-                        self.auto_switch_language, 
-                        self.update_status
-                    )
-                )
-                
-                keyboard.add_hotkey(
-                    self.translate_hotkey, 
-                    lambda: translator.hotkey_translation(
-                        self.trans_direction_var.get(),
-                        self.update_status
-                    )
-                )
-                
                 self.toggle_button.config(text="כבה האזנה לקיצורי מקשים")
                 self.update_status(f"מאזין לקיצורים: המרה ({self.hotkey}), תרגום ({self.translate_hotkey})")
                 self.hotkey_entry.config(state="disabled")
@@ -284,13 +381,6 @@ class KeyboardConverterApp:
             return
         
         try:
-            # בדיקה אם קיצורי המקשים תקינים
-            keyboard.add_hotkey(new_hotkey, lambda: None)
-            keyboard.remove_hotkey(new_hotkey)
-            
-            keyboard.add_hotkey(new_translate_hotkey, lambda: None)
-            keyboard.remove_hotkey(new_translate_hotkey)
-            
             # שמירת קיצורי המקשים החדשים
             self.hotkey = new_hotkey
             self.translate_hotkey = new_translate_hotkey
@@ -379,5 +469,8 @@ class KeyboardConverterApp:
     def on_closing(self):
         """פונקציה לסגירת החלון"""
         if self.is_listening:
-            keyboard.unhook_all()
+            if PYNPUT_AVAILABLE and self.listener:
+                self.listener.stop()
+            else:
+                keyboard_lib.unhook_all()
         self.root.destroy()
